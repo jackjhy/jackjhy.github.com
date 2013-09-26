@@ -1,6 +1,6 @@
 ---
 layout: page
-title: Wellllllllllllcom to My Corner
+title: Welcom to My Corner
 tagline: Supporting tagline
 ---
 {% include JB/setup %}
