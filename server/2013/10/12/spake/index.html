@@ -1,0 +1,476 @@
+
+
+<!DOCTYPE html>
+<!--[if lt IE 7]> <html class="no-js lt-ie9 lt-ie8 lt-ie7 ie" lang="en"> <![endif]-->
+<!--[if IE 7]>    <html class="no-js lt-ie9 lt-ie8 ie" lang="en"> <![endif]-->
+<!--[if IE 8]>    <html class="no-js lt-ie9 ie" lang="en"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en"> <!--<![endif]-->
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1">
+	<title>Spake計算流程詳細分析</title>
+	<meta name="author" content="Tiger Ji">
+	<link href='/assets/themes/the-program/css/style.css' rel="stylesheet" media="all">
+	<link href="http://feeds.feedburner.com/" rel="alternate" title="Spake計算流程詳細分析" type="application/atom+xml">
+	<script src="http://cdnjs.cloudflare.com/ajax/libs/modernizr/2.0.6/modernizr.min.js"></script>
+</head>
+<body>
+
+<div id="page" class="hentry">
+	<header class="the-header">
+		<div class="unit-head">
+			<div class="unit-inner unit-head-inner">
+				<nav class="nav-global">
+					<ul>
+						<li class="logo"><a href="/">Tiger's Corner</a></li>
+						<li class="archive"><a href="/archive.html">archive</a></li>
+						<li class="page"><a href="/pages.html">pages</a></li>
+						<li class="category"><a href="/categories.html">categories</a></li>
+						<li class="tag"><a href="/tags.html">tags</a></li>
+					</ul>
+				</nav>
+			</div><!-- unit-inner -->
+		</div><!-- unit-head -->
+	</header>
+	<div class="body" role="main">
+		<div class="unit-body">
+			<div class="unit-inner unit-body-inner">
+				<div class="entry-content">
+					
+
+<article class="unit-article layout-post">
+	<div class="unit-inner unit-article-inner">
+		<div class="content">
+			<header>
+				<div class="unit-head">
+					<div class="unit-inner unit-head-inner">
+						<h1 class="h2 entry-title">Spake計算流程詳細分析</h1>
+					</div><!-- unit-inner -->
+				</div><!-- unit-head -->
+			</header>
+
+			<div class="bd">
+				<div class="entry-content">
+					<h1>概述</h1>
+
+<p>对于一个分布式的计算系统来说，一般而言，都可以从两个方面来描述：
+- 计算任务的管理维护（划分，分配，监控），简而言之，一个任务的管理调度模块
+- 任务的计算执行模块</p>
+
+<p>参考这个逻辑，Spark也可以从这两个方面来做比较深入的分析，去领悟RDD设计的巧妙，并且与Hadoop等其他分布式系统相关组件进行对照。</p>
+
+<h2>任务调度</h2>
+
+<p>Spark中的术语叫做Driver Program，它是一个单独的JVM应用，跑在独立的虚拟机进程上，通过main方法启动。以example源码中SparkPi为例</p>
+
+<pre><code>/** Computes an approximation to pi */
+object SparkPi {
+        def main(args: Array[String]) {
+                if (args.length == 0) {
+                        System.err.println(&quot;Usage: SparkPi &lt;master&gt; [&lt;slices&gt;]&quot;)
+                                System.exit(1)
+                }
+                val spark = new SparkContext(args(0), &quot;SparkPi&quot;,
+                                System.getenv(&quot;SPARK_HOME&quot;), Seq(System.getenv(&quot;SPARK_EXAMPLES_JAR&quot;)))
+                        val slices = if (args.length &gt; 1) args(1).toInt else 2
+                        val n = 100000 * slices
+                        val count = spark.parallelize(1 to n, slices).map { i =&gt;
+                                val x = random * 2 - 1
+                                        val y = random * 2 - 1
+                                        if (x*x + y*y &lt; 1) 1 else 0
+                        }.reduce(_ + _)
+                println(&quot;Pi is roughly &quot; + 4.0 * count / n)
+                        System.exit(0)
+        }
+}
+</code></pre>
+
+<p>那么在Driver应用内部，包含哪些组件，并如何协作？
+在上面的example代码中，看到SparkContext是应用入口，接下来，我们就在SparkContext内部做一个走马观花的黄金周大游行。
+SparkContext由一个class和伴生对象组成（这是scala语言的特性，相当于java中类中间吧static method单独抽出来放到一起。）</p>
+
+<pre><code>// Create and start the scheduler
+private var taskScheduler: TaskScheduler = {
+        // Regular expression used for local[N] master format
+        val LOCAL_N_REGEX = &quot;&quot;&quot;local\[([0-9]+)\]&quot;&quot;&quot;.r
+                // Regular expression for local[N, maxRetries], used in tests with failing tasks
+                val LOCAL_N_FAILURES_REGEX = &quot;&quot;&quot;local\[([0-9]+)\s*,\s*([0-9]+)\]&quot;&quot;&quot;.r
+                // Regular expression for simulating a Spark cluster of [N, cores, memory] locally
+                val LOCAL_CLUSTER_REGEX = &quot;&quot;&quot;local-cluster\[\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*]&quot;&quot;&quot;.r
+                // Regular expression for connecting to Spark deploy clusters
+                val SPARK_REGEX = &quot;&quot;&quot;(spark://.*)&quot;&quot;&quot;.r
+                //Regular expression for connection to Mesos cluster
+                val MESOS_REGEX = &quot;&quot;&quot;(mesos://.*)&quot;&quot;&quot;.r
+
+                master match {
+                        //...省略...
+                        case LOCAL_CLUSTER_REGEX(numSlaves, coresPerSlave, memoryPerSlave) =&gt;
+                                // Check to make sure memory requested &lt;= memoryPerSlave. Otherwise Spark will just hang.
+                                val memoryPerSlaveInt = memoryPerSlave.toInt
+                                if (SparkContext.executorMemoryRequested &gt; memoryPerSlaveInt) {
+                                        throw new SparkException(
+                                                        &quot;Asked to launch cluster with %d MB RAM / worker but requested %d MB/worker&quot;.format(
+                                                                memoryPerSlaveInt, SparkContext.executorMemoryRequested))
+                                }
+
+                        val scheduler = new ClusterScheduler(this)
+                                val localCluster = new LocalSparkCluster(
+                                                numSlaves.toInt, coresPerSlave.toInt, memoryPerSlaveInt)
+                                val sparkUrl = localCluster.start()
+                                val backend = new SparkDeploySchedulerBackend(scheduler, this, sparkUrl, appName)
+                                scheduler.initialize(backend)
+                                backend.shutdownCallback = (backend: SparkDeploySchedulerBackend) =&gt; {
+                                        localCluster.stop()
+                                }
+                        scheduler
+
+                        case &quot;yarn-standalone&quot; =&gt;
+                                val scheduler = try {
+                                        val clazz = Class.forName(&quot;org.apache.spark.scheduler.cluster.YarnClusterScheduler&quot;)
+                                                val cons = clazz.getConstructor(classOf[SparkContext])
+                                                cons.newInstance(this).asInstanceOf[ClusterScheduler]
+                                } catch {
+                                        // TODO: Enumerate the exact reasons why it can fail
+                                        // But irrespective of it, it means we cannot proceed !
+                                        case th: Throwable =&gt; {
+                                                         throw new SparkException(&quot;YARN mode not available ?&quot;, th)
+                                                 }
+                                }
+                                val backend = new StandaloneSchedulerBackend(scheduler, this.env.actorSystem)
+                                        scheduler.initialize(backend)
+                                        scheduler
+
+                                        case _ =&gt;
+                                        if (MESOS_REGEX.findFirstIn(master).isEmpty) {
+                                                logWarning(&quot;Master %s does not match expected format, parsing as Mesos URL&quot;.format(master))
+                                        }
+                                MesosNativeLibrary.load()
+                                        val scheduler = new ClusterScheduler(this)
+                                        val coarseGrained = System.getProperty(&quot;spark.mesos.coarse&quot;, &quot;false&quot;).toBoolean
+                                        val masterWithoutProtocol = master.replaceFirst(&quot;^mesos://&quot;, &quot;&quot;)  // Strip initial mesos://
+                                        val backend = if (coarseGrained) {
+                                                new CoarseMesosSchedulerBackend(scheduler, this, masterWithoutProtocol, appName)
+                                        } else {
+                                                new MesosSchedulerBackend(scheduler, this, masterWithoutProtocol, appName)
+                                        }
+                                scheduler.initialize(backend)
+                                        scheduler
+                }
+}
+        taskScheduler.start()
+        @volatile private var dagScheduler = new DAGScheduler(taskScheduler)
+        dagScheduler.start()
+ui.start()
+
+</code></pre>
+
+<p>SparkContext初始化过程当中，按照配置，分别初始化
+- TaskScheduler：任务调度
+- DAGScheduler：任务生成
+- UI：提供监控视图</p>
+
+<p>完成以上工作之后，SparkContext就已经提供了任务管理所需要的全部重要功能。</p>
+
+<h2>任务生成</h2>
+
+<p>在分析任务生成的具体流程之前，需要先了解RDD(Resilient Distributed Dataset)到底抽象了什么东西。最初的paper上面，是这么阐述的：</p>
+
+<blockquote>
+<p>We present Resilient Distributed Datasets (RDDs), a dis-
+tributed memory abstraction that lets programmers per-
+form in-memory computations on large clusters in a
+fault-tolerant manner. RDDs are motivated by two types
+of applications that current computing frameworks han-
+dle inefficiently: iterative algorithms and interactive data
+mining tools.</p>
+
+<p>/**
+ * A Resilient Distributed Dataset (RDD), the basic abstraction in Spark. Represents an immutable,
+ * partitioned collection of elements that can be operated on in parallel. This class contains the
+ * basic operations available on all RDDs, such as <code>map</code>, <code>filter</code>, and <code>persist</code>. In addition,
+ * [[org.apache.spark.rdd.PairRDDFunctions]] contains operations available only on RDDs of key-value
+ * pairs, such as <code>groupByKey</code> and <code>join</code>; [[org.apache.spark.rdd.DoubleRDDFunctions]] contains
+ * operations available only on RDDs of Doubles; and [[org.apache.spark.rdd.SequenceFileRDDFunctions]]
+ * contains operations available on RDDs that can be saved as SequenceFiles. These operations are
+ * automatically available on any RDD of the right type (e.g. RDD[(Int, Int)] through implicit
+ * conversions when you <code>import org.apache.spark.SparkContext._</code>.
+ *
+ * Internally, each RDD is characterized by five main properties:
+ *
+ *  - A list of partitions
+ *  - A function for computing each split
+ *  - A list of dependencies on other RDDs
+ *  - Optionally, a Partitioner for key-value RDDs (e.g. to say that the RDD is hash-partitioned)
+ *  - Optionally, a list of preferred locations to compute each split on (e.g. block locations for
+ *    an HDFS file)
+ *
+ * All of the scheduling and execution in Spark is done based on these methods, allowing each RDD
+ * to implement its own way of computing itself. Indeed, users can implement custom RDDs (e.g. for
+ * reading data from a new storage system) by overriding these functions. Please refer to the
+ * [[<a href="http://www.cs.berkeley.edu/%7Ematei/papers/2012/nsdi_spark.pdf">http://www.cs.berkeley.edu/~matei/papers/2012/nsdi_spark.pdf</a> Spark paper]] for more details
+ * on RDD internals.
+ */</p>
+</blockquote>
+
+<p>大致翻译过来的意思是说，RDD是为适用于大型的分布式迭代计算和交互数据挖掘构想的in-memory的数据抽象，根据此类计算需求的特征，抽象出RDD五个主要属性。并提供两类operation，分别是transformation和action，输出类型还是RDD的operation定义为transformation，其他的是action。更多RDD的细节，在后面的分析中会进一步设计。这里需要先知道的是，Spark的任务生成，真正的触发是action类型的RDD操作。</p>
+
+<p>回到之前的栗子</p>
+
+<pre><code>val count = spark.parallelize(1 to n, slices).map { i =&gt;
+        val x = random * 2 - 1
+                val y = random * 2 - 1
+                if (x*x + y*y &lt; 1) 1 else 0
+}.reduce(_ + _)
+···
+
+栗子里面，有三瓣肉，分别是
+* parallelize
+* map
+* reduce
+
+其中parallellize和map是transformation，reduce是action。transformation我们暂时不理，重点观察reduce操作
+
+···
+/**
+ * Reduces the elements of this RDD using the specified commutative and associative binary operator.
+ */
+def reduce(f: (T, T) =&gt; T): T = {
+        val cleanF = sc.clean(f)
+                val reducePartition: Iterator[T] =&gt; Option[T] = iter =&gt; {
+                        if (iter.hasNext) {
+                                Some(iter.reduceLeft(cleanF))
+                        } else {
+                                None
+                        }
+                }
+        var jobResult: Option[T] = None
+                val mergeResult = (index: Int, taskResult: Option[T]) =&gt; {
+                        if (taskResult != None) {
+                                jobResult = jobResult match {
+                                        case Some(value) =&gt; Some(f(value, taskResult.get))
+                                                case None =&gt; taskResult
+                                }
+                        }
+                }
+        _sc.runJob(this, reducePartition, mergeResult)_
+                // Get the final result out of our Option, or throw an exception if the RDD was empty
+                jobResult.getOrElse(throw new UnsupportedOperationException(&quot;empty collection&quot;))
+}
+</code></pre>
+
+<p>runJob的具体实现</p>
+
+<pre><code>/**
+ * Run a function on a given set of partitions in an RDD and pass the results to the given
+ * handler function. This is the main entry point for all actions in Spark. The allowLocal
+ * flag specifies whether the scheduler can run the computation on the driver rather than
+ * shipping it out to the cluster, for short actions like first().
+ */
+def runJob[T, U: ClassManifest](
+                rdd: RDD[T],
+                func: (TaskContext, Iterator[T]) =&gt; U,
+                partitions: Seq[Int],
+                allowLocal: Boolean,
+                resultHandler: (Int, U) =&gt; Unit) {
+        val callSite = Utils.formatSparkCallSite
+                logInfo(&quot;Starting job: &quot; + callSite)
+                val start = System.nanoTime
+                val result = dagScheduler.runJob(rdd, func, partitions, callSite, allowLocal, resultHandler,
+                                localProperties.get)
+                logInfo(&quot;Job finished: &quot; + callSite + &quot;, took &quot; + (System.nanoTime - start) / 1e9 + &quot; s&quot;)
+                rdd.doCheckpoint()
+                result
+}
+</code></pre>
+
+<p>从这里开始，进入DAGScheduler内部，正式开始任务生成操作
+DAGScheduler中生成任务分成两个部分，第一个部分是封装job的各种属性到一个JobSubmit对象，保存到一个Queue里面，并持有一个JobWaiter对象，等待job执行完毕。另一部是DAGScheduler定时检查Queue，进行任务的实际生成流程。</p>
+
+<pre><code>private def run() {
+        SparkEnv.set(env)
+
+                while (true) {
+                        val event = eventQueue.poll(POLL_TIMEOUT, TimeUnit.MILLISECONDS)
+                                if (event != null) {
+                                        logDebug(&quot;Got event of type &quot; + event.getClass.getName)
+                                }
+                        this.synchronized { // needed in case other threads makes calls into methods of this class
+                                if (event != null) {
+                                        if (processEvent(event)) {
+                                                return
+                                        }
+                                }
+
+</code></pre>
+
+<p>接下来，Job的划分流程，氛围几个阶段
+* 生成Stage
+* 生成Task</p>
+
+<pre><code>case JobSubmitted(finalRDD, func, partitions, allowLocal, callSite, listener, properties) =&gt;
+val jobId = nextJobId.getAndIncrement()
+val finalStage = newStage(finalRDD, None, jobId, Some(callSite))
+val job = new ActiveJob(jobId, finalStage, func, partitions, callSite, listener, properties)
+clearCacheLocs()
+logInfo(&quot;Got job &quot; + job.jobId + &quot; (&quot; + callSite + &quot;) with &quot; + partitions.length +
+                &quot; output partitions (allowLocal=&quot; + allowLocal + &quot;)&quot;)
+logInfo(&quot;Final stage: &quot; + finalStage + &quot; (&quot; + finalStage.name + &quot;)&quot;)
+logInfo(&quot;Parents of final stage: &quot; + finalStage.parents)
+logInfo(&quot;Missing parents: &quot; + getMissingParentStages(finalStage))
+if (allowLocal &amp;&amp; finalStage.parents.size == 0 &amp;&amp; partitions.length == 1) {
+        // Compute very short actions like first() or take() with no parent stages locally.
+        runLocally(job)
+} else {
+        listenerBus.post(SparkListenerJobStart(job, properties))
+                idToActiveJob(jobId) = job
+                activeJobs += job
+                resultStageToJob(finalStage) = job
+                submitStage(finalStage)
+}
+</code></pre>
+
+					<div class="meta">
+						<p class="date-publish">
+							Published: 
+							<date class="date-pub" title="2013-10-12T00:00:00+08:00" datetime="2013-10-12T00:00:00+08:00" pubdate>
+							<span class="month"><abbr>October</abbr></span>
+							<span class="day">12</span>
+							<span class="year">2013</span>
+							</date>
+						</p>
+						<ul class="list-category list-linear">
+							<li class="list-head">category: </li>
+							
+							
+
+
+  
+     
+    	<li><a href="/categories.html#-ref">
+    		 <span>3</span>
+    	</a></li>
+    
+  
+
+
+						</ul>
+						<ul class="list-tag list-linear">
+							<li class="list-head">tags: </li>
+							
+							
+
+
+  
+     
+    	<li><a href="/tags.html#spark-ref">spark <span>1</span></a></li>
+     
+    	<li><a href="/tags.html#大数据-ref">大数据 <span>1</span></a></li>
+     
+    	<li><a href="/tags.html#分布式-ref">分布式 <span>1</span></a></li>
+    
+  
+
+
+
+						</ul>
+					</div><!-- meta -->
+				</div><!-- entry-content -->
+				<div class="misc-content">
+					<div class="social">
+						<ul class="list-linear">
+							<li><div class="twitter-tweet"><a href="https://twitter.com/share" class="twitter-share-button" data-count="horizontal" data-via="" data-lang="en">Tweet</a></div></li>
+							<li><div class="twitter-follow"><a href="https://twitter.com/" class="twitter-follow-button" data-show-count="false" data-lang="en"></a></div></li>
+						</ul>
+					</div>
+					<div class="comment">
+					
+
+
+  <div id="disqus_thread"></div>
+<script type="text/javascript">
+    var disqus_developer = 1;
+    var disqus_shortname = 'Tiger Ji'; // required: replace example with your forum shortname
+    
+    /* * * DON'T EDIT BELOW THIS LINE * * */
+    (function() {
+        var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+        dsq.src = 'http://' + disqus_shortname + '.disqus.com/embed.js';
+        (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    })();
+</script>
+<noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+<a href="http://disqus.com" class="dsq-brlink">blog comments powered by <span class="logo-disqus">Disqus</span></a>
+
+
+
+
+					</div>
+				</div><!-- misc-content -->
+			</div><!-- bd -->
+			<footer class="unit-foot">
+				<div class="unit-inner unit-foot-inner">
+					<nav class="pagination">
+						<ul>
+							
+							<li class="prev"><a class="internal" rel="prev"  href="/2013/10/08/cassandra-20" title="View Cassandra 2.0新特性">&laquo; Cassandra 2.0新特性</a></li>
+							
+							
+							
+						</ul>
+					</nav>
+					<p class="gotop">
+						<a href="#page">Back to Top</a>
+					</p>
+				</div>
+			</footer>
+
+		</div><!-- content -->
+	</div><!-- unit-inner -->
+</article>
+
+
+				</div>
+			</div><!-- unit-inner -->
+		</div><!-- unit-body -->
+	</div><!-- body -->
+	<footer class="the-footer">
+		<div class="unit-foot">
+			<div class="unit-inner unit-foot-inner">
+				<div class="misc vcard">
+					<h4>about</h4>
+					<ul>
+						<li class="contact"><address><span class="author fn n">Tiger Ji</span> - <span class="fn email">jackjhy@gmail.com</span></address></li>
+						<li class="github"><a href="http://github.com/jackjhy/" rel="me">github.com/jackjhy</a></li>
+						<li class="twitter"><a href="http://twitter.com//" rel="me">twitter.com/</a></li>
+						<li class="rss"><a href="http://feeds.feedburner.com/">Subscribe to RSS Feed</a></li>
+					</ul>
+				</div><!-- misc -->
+				<p class="licence">
+					Theme: <a href="http://layouts-the.me">the_minimum</a> based on <a href="http://jekyllbootstrap.com/">Jekyll-bootstrap</a>.<br>
+					Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a>.
+				</p>
+			</div><!-- unit-foot-inner -->
+		</div><!-- unit-foot -->
+	</footer>
+</div><!-- page -->
+<script>
+	(function(d, s) {
+		var js, fjs = d.getElementsByTagName(s)[0], load = function(url, id) {
+		if (d.getElementById(id)) {return;}
+		js = d.createElement(s); js.src = url; js.id = id;
+		fjs.parentNode.insertBefore(js, fjs);
+		};
+	load('//platform.twitter.com/widgets.js', 'tweetjs');
+	// load('https://apis.google.com/js/plusone.js', 'gplus1js'); // Checkout http://j.mp/ApDgMr for usage html for this is <div class="g-plusone" data-size="medium"></div>
+	// load('//connect.facebook.net/en_US/all.js#xfbml=1', 'fbjssdk'); // Checkout http://j.mp/wZw2xR for using open graph protorol html for this is <div class="fb-like" data-href="/2013/10/12/spake" data-send="false" data-layout="button_count" data-width="450" data-show-faces="false" data-font="verdana"></div>
+	}(document, 'script'));
+</script>
+<script>
+/*! A fix for the iOS orientationchange zoom bug.Script by @scottjehl, rebound by @wilto. MIT License.*/
+(function(j){var i=j.document;if(!i.querySelectorAll){return}var l=i.querySelectorAll("meta[name=viewport]")[0],a=l&&l.getAttribute("content"),h=a+", maximum-scale=1.0",d=a+", maximum-scale=10.0",g=true,c=j.orientation,k=0;if(!l){return}function f(){l.setAttribute("content",d);g=true}function b(){l.setAttribute("content",h);g=false}function e(m){c=Math.abs(j.orientation);k=Math.abs(m.gamma);if(k>8&&c===0){if(g){b()}}else{if(!g){f()}}}j.addEventListener("orientationchange",f,false);j.addEventListener("deviceorientation",e,false)})(this);
+</script>
+  
+  
+</body>
+</html>
+

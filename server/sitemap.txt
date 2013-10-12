@@ -1,0 +1,14 @@
+
+http://jackjhy.github.io/archive.html
+http://jackjhy.github.io/categories.html
+http://jackjhy.github.io/index.html
+http://jackjhy.github.io/atom.xml
+http://jackjhy.github.io/tags.html
+http://jackjhy.github.io/sitemap.txt
+http://jackjhy.github.io/pages.html
+http://jackjhy.github.io/rss.xml
+
+http://jackjhy.github.io/2013/10/12/spake
+http://jackjhy.github.io/2013/10/08/cassandra-20
+http://jackjhy.github.io/2013/09/25/hello-tiger-ji
+http://jackjhy.github.io/lessons/2011/12/29/jekyll-introduction
