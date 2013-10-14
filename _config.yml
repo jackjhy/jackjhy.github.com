@@ -80,7 +80,7 @@ JB :
   comments :
     provider : disqus
     disqus :
-      short_name : Tiger Ji
+      short_name : jackjhy
     livefyre :
       site_id : 123
     intensedebate :
