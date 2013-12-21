@@ -111,7 +111,7 @@ Vector Clock
 
 Paxos
 ===
-给个超链接，wiki(http://zh.wikipedia.org/wiki/Paxos%E7%AE%97%E6%B3%95)
+给个超链接，[wiki](http://zh.wikipedia.org/wiki/Paxos%E7%AE%97%E6%B3%95)
 另外，有一个关于Paxos的有趣故事：
 
 > Lamport大牛在他Paxos的第一个版本早在1990年就提交给ACM TOCS Jnl.的评审委员会了 但是当时没有人理解他的算法 主编回执他的稿子建议他用数学而不是神话描述他的算法 他们才会考虑接受这篇paper
