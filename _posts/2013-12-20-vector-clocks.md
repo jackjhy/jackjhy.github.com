@@ -79,7 +79,7 @@ Vector Clock
 > * 规则2：每个消息捎带发送方在发送时的向量时钟。当接收到一个消息（m, LCj, j）时，Pi执行更新： LCi[k] := max(LCi[k], LCj[k]), 1<=k<=n LCi[i] := LCi[i]+d 
 > 
 > 下图为增量值d=1，初始值init=0时的示例图
-> 
+> ![示意图](https://raw.github.com/jackjhy/jackjhy.github.com/master/images/vc.png)
 > 数据一致性（Quorum） 定义
 >
 > * N：系统中数据的备份数
